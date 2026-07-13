@@ -65,8 +65,12 @@ async def analyze_profile(request: AnalyzeRequest) -> AnalyzeResponse:
         cached=False,
     )
 
-    # Store without the per-request `cached` flag so it's meaningless in the cache itself.
-    profile_cache[key] = response.model_dump(exclude={"cached"})
+    if ai_result.get("_ai_degraded", False):
+        logger.warning("Not caching %s — AI scoring degraded this request", key)
+    else:
+        # Store without the per-request `cached` flag so it's meaningless in the cache itself.
+        profile_cache[key] = response.model_dump(exclude={"cached"})
+
     return response
 
 
