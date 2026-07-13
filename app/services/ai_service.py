@@ -1,28 +1,26 @@
 """
-LLM-based cognitive scoring via NVIDIA NIM (OpenAI-compatible endpoint).
+LLM-based cognitive scoring via an OpenAI-compatible endpoint (currently Gemini).
 
-Changes from v1 that matter in production:
+Changes that matter in production:
   1. AsyncOpenAI, not OpenAI. The sync client's .create() call blocks the
      whole event loop while it waits on the network — inside an `async def`
      FastAPI route that stalls every other in-flight request on the worker.
   2. Structured `tips` in the response, not a single ai_insight string.
      "Tips to improve the profile" is the actual product — a paragraph of
      prose isn't something a UI can render as a checklist.
-  3. Explicit completion params. deepseek-v4-flash is a reasoning model, and
-     on NIM it's gated by `extra_body.chat_template_kwargs` rather than a
-     plain `reasoning_effort` field — omitting it means relying on an
-     undocumented default, which some integrations report as hangs or empty
-     reasoning_content. max_tokens is set explicitly for the same reason:
-     with thinking enabled, the reasoning trace consumes tokens *before* the
-     final JSON is generated, so a too-low budget silently truncates the
-     answer instead of the thinking.
+  3. Explicit completion params (max_tokens, reasoning_effort, sampling) set
+     from config rather than left as provider defaults — free-tier hosted
+     endpoints are exactly where undocumented defaults bite you.
+  4. `_ai_degraded` sentinel on the returned dict. main.py checks this before
+     writing to the cache — a transient LLM outage should never get cached
+     as if it were a real result for 48 hours.
 
-Note on sampling: DeepSeek recommends temperature=1.0 / top_p=1.0 for their
-reasoning modes — low temperature can make some reasoning models degrade or
-loop mid-thought. We follow that recommendation here and lean on
-response_format=json_object plus the deterministic math score (see
-scoring_service.py) to keep the *product* consistent, rather than fighting
-the model's training distribution with temperature.
+Previously ran against NVIDIA NIM's deepseek-v4-flash, which required NIM's
+non-standard `extra_body.chat_template_kwargs` to control thinking and was
+unreliable on the free tier (frequent 503 "workers busy" under load). Gemini's
+OpenAI-compat layer takes `reasoning_effort` as a plain parameter, so that
+plumbing is gone — swapping providers again later just means changing the
+values in config.py, not this file's logic.
 """
 
 import json
@@ -36,8 +34,8 @@ logger = logging.getLogger(__name__)
 _settings = get_settings()
 
 _client = AsyncOpenAI(
-    base_url=_settings.nvidia_base_url,
-    api_key=_settings.nvidia_api_key,
+    base_url=_settings.llm_base_url,
+    api_key=_settings.llm_api_key,
     timeout=_settings.llm_request_timeout,
 )
 
@@ -73,6 +71,7 @@ _FALLBACK = {
     "cognitive_total": 0,
     "ai_insight": "AI evaluation is unavailable right now — showing the deterministic score only.",
     "tips": [],
+    "_ai_degraded": True,
 }
 
 _README_EXCERPT_CHARS = 1200  # keep token usage predictable regardless of README length
@@ -124,46 +123,38 @@ async def get_cognitive_score(pinned_repos: list[dict], target_role: str | None)
         return {
             **_FALLBACK,
             "ai_insight": "No pinned repos to analyze — pin 4-6 of your strongest projects first.",
+            "_ai_degraded": False,  # true result, not a failure — fine to cache
         }
 
     pruned = [_prune_repo(r) for r in pinned_repos]
     role_label = target_role or "general software engineering"
 
-    extra_body = {}
-    if _settings.nvidia_thinking_enabled:
-        extra_body["chat_template_kwargs"] = {
-            "thinking": True,
-            "reasoning_effort": _settings.nvidia_reasoning_effort,
-        }
-
     try:
         response = await _client.chat.completions.create(
-            model=_settings.nvidia_model,
+            model=_settings.llm_model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT.format(role=role_label)},
                 {"role": "user", "content": json.dumps(pruned)},
             ],
-            temperature=_settings.nvidia_temperature,
-            top_p=_settings.nvidia_top_p,
-            max_tokens=_settings.nvidia_max_tokens,
+            temperature=_settings.llm_temperature,
+            top_p=_settings.llm_top_p,
+            max_tokens=_settings.llm_max_tokens,
             response_format={"type": "json_object"},
-            extra_body=extra_body,
+            reasoning_effort=_settings.llm_reasoning_effort,
         )
         message = response.choices[0].message
 
         # Reasoning trace is useful for debugging/prompt-tuning during dev — log it,
-        # never return it to the API caller (it's not part of the product, and it's
-        # extra tokens the client has no use for).
         reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
         if reasoning:
-            logger.debug("NIM reasoning trace: %s", reasoning)
+            logger.debug("LLM reasoning trace: %s", reasoning)
 
         parsed = json.loads(_strip_json_fences(message.content))
         parsed.setdefault("tips", [])
         parsed.setdefault("ai_insight", "")
+        parsed.setdefault("_ai_degraded", False)
         return parsed
     except (json.JSONDecodeError, KeyError, IndexError, AttributeError) as exc:
-        # Model returned something we couldn't parse as the expected JSON shape.
         logger.warning("LLM response did not match expected shape: %s", exc)
         return _FALLBACK
     except Exception as exc:  # noqa: BLE001 — deliberately broad: any NIM/network failure
