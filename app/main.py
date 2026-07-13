@@ -38,8 +38,6 @@ async def analyze_profile(request: AnalyzeRequest) -> AnalyzeResponse:
     except GithubUserNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except GithubApiError as exc:
-        # Retries already happened inside github_service — this means GitHub
-        # stayed unavailable through all of them.
         raise HTTPException(status_code=502, detail=f"GitHub is unavailable right now: {exc}") from exc
 
     pinned_repos = (github_data.get("pinnedItems") or {}).get("nodes") or []
@@ -68,7 +66,6 @@ async def analyze_profile(request: AnalyzeRequest) -> AnalyzeResponse:
     if ai_result.get("_ai_degraded", False):
         logger.warning("Not caching %s — AI scoring degraded this request", key)
     else:
-        # Store without the per-request `cached` flag so it's meaningless in the cache itself.
         profile_cache[key] = response.model_dump(exclude={"cached"})
 
     return response
