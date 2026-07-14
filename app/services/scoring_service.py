@@ -70,16 +70,19 @@ def calculate_math_score(github_data: dict) -> dict:
         score += _ACCOUNT_AGE_2Y_PLUS
 
     pinned = (github_data.get("pinnedItems") or {}).get("nodes") or []
+    recent = (github_data.get("repositories") or {}).get("nodes") or []
 
-    score += min(len(pinned) * _PINNED_COUNT_PER_REPO, _PINNED_COUNT_CAP)
+    showcase_repos = pinned if pinned else recent[:6]
 
-    documented = sum(1 for r in pinned if r.get("description"))
+    score += min(len(showcase_repos) * _PINNED_COUNT_PER_REPO, _PINNED_COUNT_CAP)
+
+    documented = sum(1 for r in showcase_repos if r.get("description"))
     score += min(documented * _DOCUMENTED_PER_REPO, _DOCUMENTED_CAP)
 
-    licensed = sum(1 for r in pinned if r.get("licenseInfo"))
+    licensed = sum(1 for r in showcase_repos if r.get("licenseInfo"))
     score += min(licensed * _LICENSED_PER_REPO, _LICENSED_CAP)
 
-    with_readme = sum(1 for r in pinned if _has_readme(r))
+    with_readme = sum(1 for r in showcase_repos if _has_readme(r))
     score += min(with_readme * _README_PER_REPO, _README_CAP)
 
     contributions = github_data.get("contributionsCollection") or {}
