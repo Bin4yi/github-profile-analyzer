@@ -15,6 +15,11 @@ _settings = get_settings()
 
 profile_cache: TTLCache = TTLCache(maxsize=_settings.cache_maxsize, ttl=_settings.cache_ttl_seconds)
 
+# Separate cache/TTLCache instance from profile_cache: the raw stats endpoint has no
+# target_role dimension and a different response shape, so it gets its own namespace
+# rather than sharing keys with the AI-scored /analyze cache.
+stats_cache: TTLCache = TTLCache(maxsize=_settings.cache_maxsize, ttl=_settings.cache_ttl_seconds)
+
 
 def cache_key(username: str, target_role: str | None) -> str:
     """
@@ -25,3 +30,7 @@ def cache_key(username: str, target_role: str | None) -> str:
     """
     normalized_role = (target_role or "").strip().lower()
     return f"{username.strip().lower()}:{normalized_role}"
+
+
+def stats_cache_key(username: str) -> str:
+    return username.strip().lower()

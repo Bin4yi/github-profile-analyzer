@@ -15,6 +15,8 @@ Additions vs. the v1 query:
     explains itself is a stronger hire-signal than raw code volume.
 """
 
+from datetime import datetime, timedelta, timezone
+
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -71,19 +73,76 @@ query($username: String!) {
 }
 """
 
+# Raw-stats query — deliberately separate from _QUERY above rather than merged into it:
+# the /analyze endpoint doesn't need calendar/language/PR data, and this endpoint doesn't
+# need README/license/topics data, so keeping them apart avoids paying for unused fields
+# (and unused GitHub API rate-limit cost) on either path.
+_STATS_QUERY = """
+query($username: String!, $from: DateTime!, $to: DateTime!) {
+  user(login: $username) {
+    repositories(
+      first: 20
+      isFork: false
+      ownerAffiliations: [OWNER]
+      orderBy: {field: STARGAZERS, direction: DESC}
+    ) {
+      totalCount
+      nodes {
+        name
+        description
+        stargazerCount
+        primaryLanguage { name }
+        languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+          edges {
+            size
+            node { name }
+          }
+        }
+        defaultBranchRef {
+          target {
+            ... on Commit {
+              history(first: 5) {
+                nodes { messageHeadline committedDate }
+              }
+            }
+          }
+        }
+      }
+    }
+    pullRequests(states: [MERGED], first: 20, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number
+        title
+        bodyText
+        mergedAt
+        repository { name }
+      }
+    }
+    contributionsCollection(from: $from, to: $to) {
+      totalCommitContributions
+      commitContributionsByRepository(maxRepositories: 25) {
+        repository { name }
+        contributions { totalCount }
+      }
+      contributionCalendar {
+        weeks {
+          contributionDays { date contributionCount }
+        }
+      }
+    }
+  }
+}
+"""
 
-@retry(
-    reraise=True,
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.5, min=1, max=8),
-    retry=retry_if_exception_type(GithubApiError),
-)
-async def fetch_github_data(username: str) -> dict:
+
+async def _run_query(query: str, variables: dict) -> dict:
     """
+    Shared GraphQL execution + error handling for both _QUERY and _STATS_QUERY.
+
     Raises:
         GithubUserNotFoundError: user doesn't exist / is inaccessible — not worth retrying.
-        GithubApiError: transient failure (timeout, rate limit, 5xx) — retried automatically,
-            then re-raised to the caller if retries are exhausted.
+        GithubApiError: transient failure (timeout, rate limit, 5xx) — retried by callers,
+            then re-raised if retries are exhausted.
     """
     async with httpx.AsyncClient(timeout=_settings.github_request_timeout) as client:
         try:
@@ -93,7 +152,7 @@ async def fetch_github_data(username: str) -> dict:
                     "Authorization": f"Bearer {_settings.github_token}",
                     "Content-Type": "application/json",
                 },
-                json={"query": _QUERY, "variables": {"username": username}},
+                json={"query": query, "variables": variables},
             )
         except httpx.TimeoutException as exc:
             raise GithubApiError(f"GitHub request timed out: {exc}") from exc
@@ -112,12 +171,45 @@ async def fetch_github_data(username: str) -> dict:
 
     if "errors" in payload:
         messages = "; ".join(e.get("message", "unknown error") for e in payload["errors"])
-        raise GithubUserNotFoundError(f"GitHub query error for '{username}': {messages}")
+        raise GithubUserNotFoundError(f"GitHub query error for '{variables.get('username')}': {messages}")
 
     user = (payload.get("data") or {}).get("user")
     if user is None:
         # Query succeeded but returned null — user doesn't exist, was renamed, or is a bot/org
         # edge case the schema doesn't cover.
-        raise GithubUserNotFoundError(f"GitHub user '{username}' not found or inaccessible")
+        raise GithubUserNotFoundError(f"GitHub user '{variables.get('username')}' not found or inaccessible")
 
     return user
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=1, max=8),
+    retry=retry_if_exception_type(GithubApiError),
+)
+async def fetch_github_data(username: str) -> dict:
+    return await _run_query(_QUERY, {"username": username})
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=1, max=8),
+    retry=retry_if_exception_type(GithubApiError),
+)
+async def fetch_profile_stats_data(username: str) -> dict:
+    """
+    Raw-stats data for the decoupled /api/v1/profile endpoint.
+
+    contributionsCollection only accepts a <=1 year [from, to) span, so `from`/`to`
+    are pinned to a trailing 365-day window ending now — this also means totalCommits
+    and the contribution calendar reflect the last 12 months, not lifetime activity.
+    """
+    now = datetime.now(timezone.utc)
+    variables = {
+        "username": username,
+        "from": (now - timedelta(days=365)).isoformat(),
+        "to": now.isoformat(),
+    }
+    return await _run_query(_STATS_QUERY, variables)
