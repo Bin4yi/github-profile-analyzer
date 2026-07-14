@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     cache_maxsize: int = 1000
     cache_ttl_seconds: int = 172_800  # 48 hours
 
+    # --- Logging ---
+    log_dir: str = "logs"  
+    log_level: str = "INFO"
+    log_max_bytes: int = 10_000_000  # 10MB per file before rotating
+    log_backup_count: int = 5  # keep 5 rotated files per log (app.log.1, .2, ...)
+
 
 @lru_cache
 def get_settings() -> Settings:

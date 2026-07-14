@@ -4,13 +4,16 @@ from fastapi import FastAPI, HTTPException
 
 from app.core.cache import cache_key, profile_cache
 from app.core.exceptions import GithubApiError, GithubUserNotFoundError
+from app.core.logging_config import setup_logging
+from app.core.middleware import AccessLogMiddleware
 from app.schemas import AnalyzeRequest, AnalyzeResponse, ProfileTip, ScoreBreakdown
 from app.services import ai_service, github_service, scoring_service
 
-logging.basicConfig(level=logging.INFO)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="GitHub Profile Analyzer")
+app.add_middleware(AccessLogMiddleware)
 
 
 def _tier(total_score: int) -> str:
@@ -41,9 +44,10 @@ async def analyze_profile(request: AnalyzeRequest) -> AnalyzeResponse:
         raise HTTPException(status_code=502, detail=f"GitHub is unavailable right now: {exc}") from exc
 
     pinned_repos = (github_data.get("pinnedItems") or {}).get("nodes") or []
+    recent_repos = (github_data.get("repositories") or {}).get("nodes") or []
 
     math_result = scoring_service.calculate_math_score(github_data)
-    ai_result = await ai_service.get_cognitive_score(pinned_repos, request.target_role)
+    ai_result = await ai_service.get_cognitive_score(pinned_repos, recent_repos, request.target_role)
 
     final_score = math_result["math_score"] + ai_result["cognitive_total"]
 
