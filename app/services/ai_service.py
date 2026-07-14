@@ -202,3 +202,74 @@ async def get_cognitive_score(
     except Exception as exc:  # noqa: BLE001 — deliberately broad: any provider/network failure
         logger.warning("LLM call failed: %s", exc)
         return _FALLBACK
+
+
+_IMPACT_BODY_EXCERPT_CHARS = 500  # keep token usage predictable regardless of PR/commit body length
+
+_IMPACT_SYSTEM_PROMPT = """\
+You are a technical recruiter summarizing a candidate's recent GitHub activity.
+
+You are given a JSON array of recent commits/PRs, each with an index, repo name, and a
+raw title/message (plus body text when available). For EVERY item, write one short,
+human-readable outcome sentence (max ~12 words) describing the likely IMPACT of that
+change — not a restatement of the message. Infer impact conservatively from what the
+message/body actually says (e.g. "add index" -> "Faster query lookups"); don't invent
+metrics or numbers that aren't implied by the text.
+
+Return ONLY valid JSON, no markdown fences, exactly matching this shape:
+{
+  "impacts": [
+    {"index": <int>, "impact": "<string>"}
+  ]
+}
+One entry per input item, same indices, no omissions.
+"""
+
+
+def _prune_activity_item(index: int, item: dict) -> dict:
+    body = (item.get("body") or "")[:_IMPACT_BODY_EXCERPT_CHARS]
+    return {
+        "index": index,
+        "repo": item.get("repo"),
+        "message": item.get("message"),
+        "body": body,
+    }
+
+
+async def summarize_activity_impacts(items: list[dict]) -> list[str]:
+    """
+    Takes a list of {"repo", "message", "body"} dicts (recent PRs/commits, most-recent-first)
+    and returns a same-length, same-order list of short human-readable impact strings.
+
+    Falls back to echoing each item's own message as its impact on any LLM failure —
+    degraded, but keeps the raw-stats endpoint available even when the LLM is down.
+    """
+    if not items:
+        return []
+
+    fallback = [item.get("message", "") for item in items]
+    payload = [_prune_activity_item(i, item) for i, item in enumerate(items)]
+
+    try:
+        response = await _client.chat.completions.create(
+            model=_settings.llm_model,
+            messages=[
+                {"role": "system", "content": _IMPACT_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+            temperature=_settings.llm_temperature,
+            top_p=_settings.llm_top_p,
+            max_tokens=_settings.llm_max_tokens,
+            response_format={"type": "json_object"},
+            reasoning_effort=_settings.llm_reasoning_effort,
+        )
+        message = response.choices[0].message
+        parsed = json.loads(_strip_json_fences(message.content))
+        impacts_by_index = {entry["index"]: entry["impact"] for entry in parsed["impacts"]}
+        return [impacts_by_index.get(i, fallback[i]) for i in range(len(items))]
+    except (json.JSONDecodeError, KeyError, IndexError, AttributeError, TypeError) as exc:
+        logger.warning("LLM activity-impact response did not match expected shape: %s", exc)
+        return fallback
+    except Exception as exc:  # noqa: BLE001 — deliberately broad: any provider/network failure
+        logger.warning("LLM activity-impact call failed: %s", exc)
+        return fallback

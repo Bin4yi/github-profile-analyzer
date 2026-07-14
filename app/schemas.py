@@ -32,3 +32,36 @@ class AnalyzeResponse(BaseModel):
     ai_insight: str
     tips: list[ProfileTip]
     cached: bool = False
+
+
+class TopRepo(BaseModel):
+    name: str
+    description: str | None
+    language: str | None
+    stars: int
+    commits: int
+
+
+class RecentActivityItem(BaseModel):
+    repo: str
+    prRef: str
+    message: str
+    impact: str
+    date: str
+
+
+class ContributionDay(BaseModel):
+    date: str
+    count: int
+
+
+class ProfileStatsResponse(BaseModel):
+    username: str
+    totalRepos: int
+    totalCommits: int
+    contributionStreakDays: int
+    topRepos: list[TopRepo]
+    recentActivity: list[RecentActivityItem]
+    languageBreakdownPct: dict[str, float]
+    contributionCalendar: list[ContributionDay]
+    cached: bool = False
