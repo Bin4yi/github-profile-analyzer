@@ -38,13 +38,68 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 _settings = get_settings()
 
-_client = AsyncOpenAI(
-    base_url=_settings.llm_base_url,
-    api_key=_settings.llm_api_key,
-    timeout=_settings.llm_request_timeout,
+# Constructing AsyncOpenAI with an empty-string key fails immediately
+# (raises OpenAIError at __init__, not at call time) -- so each client is
+# only built if its key is actually set. Either provider can run alone;
+# having neither set is a real configuration error, raised on first call
+# rather than at import time so the app still starts (e.g. GitHub-only
+# endpoints keep working) and the error is scoped to the AI-dependent paths.
+_primary_client = (
+    AsyncOpenAI(base_url=_settings.llm_base_url, api_key=_settings.llm_api_key, timeout=_settings.llm_request_timeout)
+    if _settings.llm_api_key
+    else None
+)
+
+_openai_client = (
+    AsyncOpenAI(api_key=_settings.openai_api_key, timeout=_settings.llm_request_timeout)
+    if _settings.openai_api_key
+    else None
 )
 
 _MAX_OTHER_REPOS = 6
+
+
+async def _chat_completion(system_prompt: str, user_content: str):
+    """Shared call path for both LLM uses below (cognitive scoring, activity
+    impact summaries). Tries the primary provider (Gemini by default) first if
+    configured; on ANY failure -- bad/expired key, rate limit, outage -- falls
+    back to OpenAI if configured, instead of degrading straight to the static
+    fallback. Returns the raw message object (not just its text) so callers
+    can still inspect Gemini-specific extensions like
+    `.reasoning`/`.reasoning_content` when the primary call succeeds.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    if _primary_client is not None:
+        try:
+            response = await _primary_client.chat.completions.create(
+                model=_settings.llm_model,
+                messages=messages,
+                temperature=_settings.llm_temperature,
+                top_p=_settings.llm_top_p,
+                max_tokens=_settings.llm_max_tokens,
+                response_format={"type": "json_object"},
+                reasoning_effort=_settings.llm_reasoning_effort,
+            )
+            return response.choices[0].message
+        except Exception as primary_exc:  # noqa: BLE001 — deliberately broad: any provider/network failure
+            if _openai_client is None:
+                raise
+            logger.warning("Primary LLM provider failed, falling back to OpenAI: %s", primary_exc)
+    elif _openai_client is None:
+        raise RuntimeError("No LLM provider configured -- set LLM_API_KEY and/or OPENAI_API_KEY")
+
+    response = await _openai_client.chat.completions.create(
+        model=_settings.openai_model,
+        messages=messages,
+        temperature=_settings.llm_temperature,
+        top_p=_settings.llm_top_p,
+        max_completion_tokens=_settings.llm_max_tokens,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message
 
 _SYSTEM_PROMPT = """\
 You are a senior technical recruiter reviewing a GitHub profile for a {role} role.
@@ -172,19 +227,7 @@ async def get_cognitive_score(
     role_label = target_role or "general software engineering"
 
     try:
-        response = await _client.chat.completions.create(
-            model=_settings.llm_model,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT.format(role=role_label)},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            temperature=_settings.llm_temperature,
-            top_p=_settings.llm_top_p,
-            max_tokens=_settings.llm_max_tokens,
-            response_format={"type": "json_object"},
-            reasoning_effort=_settings.llm_reasoning_effort,
-        )
-        message = response.choices[0].message
+        message = await _chat_completion(_SYSTEM_PROMPT.format(role=role_label), json.dumps(payload))
 
         reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
         if reasoning:
@@ -251,19 +294,7 @@ async def summarize_activity_impacts(items: list[dict]) -> list[str]:
     payload = [_prune_activity_item(i, item) for i, item in enumerate(items)]
 
     try:
-        response = await _client.chat.completions.create(
-            model=_settings.llm_model,
-            messages=[
-                {"role": "system", "content": _IMPACT_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            temperature=_settings.llm_temperature,
-            top_p=_settings.llm_top_p,
-            max_tokens=_settings.llm_max_tokens,
-            response_format={"type": "json_object"},
-            reasoning_effort=_settings.llm_reasoning_effort,
-        )
-        message = response.choices[0].message
+        message = await _chat_completion(_IMPACT_SYSTEM_PROMPT, json.dumps(payload))
         parsed = json.loads(_strip_json_fences(message.content))
         impacts_by_index = {entry["index"]: entry["impact"] for entry in parsed["impacts"]}
         return [impacts_by_index.get(i, fallback[i]) for i in range(len(items))]

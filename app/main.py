@@ -1,6 +1,17 @@
 import logging
+import os
+import secrets
 
-from fastapi import FastAPI, HTTPException
+# Settings() (app/config.py) reads .env via pydantic-settings' own env_file
+# mechanism, but that only covers Settings' declared fields -- it doesn't
+# populate os.environ. GITHUB_ANALYZER_SHARED_TOKEN below is read directly
+# from os.environ, so .env must be loaded into the process explicitly here
+# too, before that read happens.
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi import Depends, FastAPI, Header, HTTPException
 
 from app.core.cache import cache_key, profile_cache, stats_cache, stats_cache_key
 from app.core.exceptions import GithubApiError, GithubUserNotFoundError
@@ -15,8 +26,20 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="GitHub Profile Analyzer")
 app.add_middleware(AccessLogMiddleware)
 
+# This service holds a real GITHUB_TOKEN and LLM_API_KEY and does real,
+# billable work per request -- it must not be an open port. core-api is the
+# only intended caller (server-to-server, never exposed to the browser),
+# same shared-secret trust model as ai-agents' AGENTS_SHARED_TOKEN.
+SHARED_TOKEN = os.environ.get("GITHUB_ANALYZER_SHARED_TOKEN", "dev-only-change-me")
 
-@app.post("/api/v1/analyze", response_model=AnalyzeResponse)
+
+def require_auth(authorization: str | None = Header(default=None)) -> None:
+    expected = f"Bearer {SHARED_TOKEN}"
+    if authorization is None or not secrets.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+@app.post("/api/v1/analyze", response_model=AnalyzeResponse, dependencies=[Depends(require_auth)])
 async def analyze_profile(request: AnalyzeRequest) -> AnalyzeResponse:
     username = request.github_username.strip()
     key = cache_key(username, request.target_role)
@@ -42,7 +65,7 @@ async def analyze_profile(request: AnalyzeRequest) -> AnalyzeResponse:
     return response
 
 
-@app.get("/api/v1/profile/{username}", response_model=ProfileStatsResponse)
+@app.get("/api/v1/profile/{username}", response_model=ProfileStatsResponse, dependencies=[Depends(require_auth)])
 async def get_profile_stats(username: str) -> ProfileStatsResponse:
     username = username.strip()
     key = stats_cache_key(username)
